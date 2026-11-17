@@ -1,1 +1,197 @@
+Project insurance_dw {
+  database_type: 'Generic'
+  Note: '''
+  Dimensional model (Kimball) for an auto insurance company.
+  Source: Kaggle "Auto Insurance Claims" (insurance_claims.csv), a single flat table.
+  Business processes: (1) claims, modeled as header + line facts; (2) policy issuance.
+  Key assumptions:
+  - No claim ID in source: nr_claim = policy_number + incident_date + incident_hour_of_the_day.
+  - No insured ID in source: policy_number is used as a proxy (1 insured per policy).
+  - Insured attributes (age, tenure, occupation...) were observed at incident date.
+  '''
+}
 
+// =====================================================================
+// CONFORMED DIMENSIONS (shared by claims and policy processes)
+// =====================================================================
+
+Table dim_date {
+  sk_date int [pk, note: 'Smart key YYYYMMDD; -1 = unknown']
+  date date
+  year int
+  quarter int
+  month int
+  day int
+  week_day varchar
+  flag_weekend int
+  Note: 'Generated, not extracted. Role-playing: incident date (claims) and issue date (policy).'
+}
+
+Table dim_insured {
+  sk_insured int [pk]
+  policy_number varchar [note: 'Natural key (proxy for insured ID: none in source)']
+  insured_zip varchar
+  insured_sex varchar
+  insured_education_level varchar
+  insured_occupation varchar
+  insured_hobbies varchar
+  insured_relationship varchar
+  capital_gains decimal
+  capital_loss decimal
+  capital_gains_range varchar
+  capital_loss_range varchar
+  birth_year int [note: 'Derived: YEAR(incident_date) - age (±1 year)']
+  start_date_as_client date [note: 'Derived: incident_date - months_as_customer']
+  valid_from date
+  valid_to date [note: '9999-12-31 for the current version']
+  flag_is_current int
+  Note: 'SCD Type 2. Current dataset holds one version per insured, observed at incident date.'
+}
+
+Table dim_auto {
+  sk_auto int [pk]
+  auto_make varchar
+  auto_model varchar
+  auto_year int
+  Note: 'Grain: 1 row per car model (make + model + year). Describes the model, not the specific vehicle: no plate or VIN in source.'
+}
+
+Table dim_policy {
+  sk_policy int [pk]
+  policy_number varchar [note: 'Natural key']
+  policy_state varchar [note: 'Kept as attribute (state-level only in source)']
+  policy_csl varchar [note: 'Combined single limit, e.g. 250/500']
+  policy_deductable decimal
+  umbrella_limit decimal
+}
+
+// =====================================================================
+// CLAIMS PROCESS
+// =====================================================================
+
+Table dim_hour {
+  sk_hour int [pk, note: '0-23; -1 = unknown']
+  hour int
+  day_period varchar
+}
+
+Table dim_geography {
+  sk_geography int [pk]
+  city varchar
+  state varchar
+  Note: 'Grain: city. Street address kept out on purpose (degenerate attribute in fct_claim) so this dimension stays reusable.'
+}
+
+Table dim_incident_type {
+  sk_incident_type int [pk]
+  incident_type varchar
+  collision_type varchar
+  incident_severity varchar
+}
+
+Table dim_report {
+  sk_report int [pk]
+  authorities_contacted varchar
+  police_report_available varchar [note: 'Yes / No / Unknown (? in source)']
+  property_damage varchar [note: 'Yes / No / Unknown (? in source)']
+  Note: 'Junk dimension: low-cardinality flags and categories of the incident report.'
+}
+
+Table dim_compensation_type {
+  sk_compensation_type int [pk]
+  compensation_type varchar [note: 'Bodily injury / Property damage / Vehicle']
+  source_column varchar [note: 'injury_claim / property_claim / vehicle_claim']
+  Note: '3 rows. Created by unpivoting the three compensation columns of the source.'
+}
+
+Table fct_claim {
+  nr_claim varchar [note: 'Degenerate dimension: policy_number + incident_date + incident_hour_of_the_day']
+  sk_claim_date int [ref: > dim_date.sk_date]
+  sk_claim_hour int [ref: > dim_hour.sk_hour]
+  sk_insured int [ref: > dim_insured.sk_insured]
+  sk_auto int [ref: > dim_auto.sk_auto]
+  sk_policy int [ref: > dim_policy.sk_policy]
+  sk_geography int [ref: > dim_geography.sk_geography]
+  sk_incident_type int [ref: > dim_incident_type.sk_incident_type]
+  sk_report int [ref: > dim_report.sk_report]
+  incident_location varchar [note: 'Degenerate attribute (street address)']
+  number_of_vehicles_involved int
+  witnesses int
+  bodily_injuries int
+  fraud_flag int [note: '0/1, comes as Y/N in source']
+  age_in_claim int [note: 'YEAR(incident_date) - dim_insured.birth_year (±1 year)']
+  time_as_customer_months int [note: 'DATEDIFF(month, dim_insured.start_date_as_client, incident_date)']
+  indexes {
+    (nr_claim) [pk]
+  }
+  Note: 'Header fact. Grain: 1 row per incident. total_claim_amount is not stored: it is SUM(fct_claim_compensation.compensation_amount).'
+}
+
+Table fct_claim_compensation {
+  nr_claim varchar [note: 'Degenerate dimension, same value as fct_claim']
+  sk_compensation_type int [ref: > dim_compensation_type.sk_compensation_type]
+  sk_claim_date int [ref: > dim_date.sk_date]
+  sk_claim_hour int [ref: > dim_hour.sk_hour]
+  sk_insured int [ref: > dim_insured.sk_insured]
+  sk_auto int [ref: > dim_auto.sk_auto]
+  sk_policy int [ref: > dim_policy.sk_policy]
+  sk_geography int [ref: > dim_geography.sk_geography]
+  sk_incident_type int [ref: > dim_incident_type.sk_incident_type]
+  sk_report int [ref: > dim_report.sk_report]
+  compensation_amount decimal
+  indexes {
+    (nr_claim, sk_compensation_type) [pk]
+  }
+  Note: '''
+  Line fact. Grain: 1 row per incident x compensation type.
+  Inherits all header dimensions. Header measures (witnesses, vehicles...) are NOT inherited:
+  they would be repeated 3x and break any SUM (fan-out).
+  '''
+}
+
+// =====================================================================
+// POLICY PROCESS
+// =====================================================================
+
+Table fct_policy {
+  sk_issue_date int [ref: > dim_date.sk_date, note: 'policy_bind_date']
+  sk_policy int [ref: > dim_policy.sk_policy]
+  sk_insured int [ref: > dim_insured.sk_insured, note: 'Insured version valid at issue date (SCD2)']
+  sk_auto int [ref: > dim_auto.sk_auto]
+  annual_premium_written decimal [note: 'Written premium (policy_annual_premium)']
+  age_at_issue int [note: 'YEAR(policy_bind_date) - dim_insured.birth_year (±1 year)']
+  time_as_customer_months_at_issue int [note: 'DATEDIFF(month, dim_insured.start_date_as_client, policy_bind_date)']
+  indexes {
+    (sk_policy, sk_issue_date) [pk]
+  }
+  Note: '''
+  Transactional fact. Grain: 1 row per policy issuance (new business or renewal).
+  Source has no renewal history, so today it holds 1 row per policy.
+  Future evolution: periodic snapshot of earned premium (policy x month).
+  '''
+}
+
+// =====================================================================
+// GROUPS (a table can belong to only one group)
+// =====================================================================
+
+TableGroup conformed_dimensions {
+  dim_date
+  dim_insured
+  dim_auto
+  dim_policy
+}
+
+TableGroup claims_process {
+  fct_claim
+  fct_claim_compensation
+  dim_hour
+  dim_geography
+  dim_incident_type
+  dim_report
+  dim_compensation_type
+}
+
+TableGroup policy_process {
+  fct_policy
+}
